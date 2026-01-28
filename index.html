@@ -132,7 +132,7 @@
               params: { points: [[0.1, 0.3], [0.3, 0.7], [0.5, 0.3], [0.7, 0.7], [0.9, 0.3]], duration: 4500 }
             },
           ],
-          totalTrials: 20,
+          totalBlocks: 15,
           targetRadius: 40, // pixels - max distance for click points
           trackingMaxDistance: 80, // pixels - distance at which tracking gives 0 points
           samplingRate: 16, // ms between position samples during tracking
@@ -143,20 +143,19 @@
             // accuracyFactor = max(0, 1 - distance/targetRadius)
             // timeFactor = max(0, 1 - reactionTime/maxReactionTime)
             maxClickPoints: 400,      // Maximum points per click (perfect accuracy + instant reaction)
-            maxReactionTime: 1000,    // RT at which time factor becomes 0 (ms)
+            optimalReactionTime: 150, // RT (ms) or less that gives max points (multiplier 1.0)
+            maxReactionTime: 1200,    // RT at which time factor becomes 0 (ms)
             
             // Tracking: points per sample = maxPointsPerSample * (1 - distance/trackingMaxDistance)
             // Only awarded if clicking/holding
             maxPointsPerSample: 5,    // Max points per 16ms sample when perfectly on target
             
-            // Grade thresholds (for labels only, not points)
-            clickPerfectDist: 10,     // Distance threshold for PERFECT label
-            clickGreatDist: 25,       // Distance threshold for GREAT label
-            clickPerfectTime: 200,    // RT threshold for PERFECT label (ms)
-            clickGreatTime: 400,      // RT threshold for GREAT label (ms)
-            trackPerfectPct: 0.9,     // Accuracy % for PERFECT label
-            trackGreatPct: 0.7,       // Accuracy % for GREAT label
-            trackOkPct: 0.5,          // Accuracy % for OK label
+            // Grade thresholds (percentage of max points)
+            gradeThresholds: {
+              perfect: 0.90, // 90% of max points
+              great: 0.75,   // 75% of max points
+              ok: 0.50       // 50% of max points
+            }
           }
         };
 
@@ -228,6 +227,19 @@
         };
 
         // ============================================
+        // GRADE CALCULATOR
+        // ============================================
+        const getGradeFromPoints = (points, maxPoints) => {
+          const ratio = points / maxPoints;
+          const thresholds = TRIAL_CONFIG.points.gradeThresholds;
+          
+          if (ratio >= thresholds.perfect) return 'PERFECT';
+          if (ratio >= thresholds.great) return 'GREAT';
+          if (ratio >= thresholds.ok) return 'OK';
+          return 'POOR';
+        };
+
+        // ============================================
         // CONTINUOUS POINT CALCULATION
         // ============================================
         const calculateClickPoints = (distance, reactionTime) => {
@@ -242,24 +254,22 @@
           // Continuous accuracy factor: 1 at center, 0 at edge
           const accuracyFactor = Math.max(0, 1 - distance / radius);
           
-          // Continuous time factor: 1 at instant, 0 at maxReactionTime
-          const timeFactor = Math.max(0, 1 - reactionTime / pts.maxReactionTime);
+          // Continuous time factor: 1 at reactionTime <= optimalReactionTime, 0 at maxReactionTime
+          // Map linear decay from optimalReactionTime to maxReactionTime
+          const effectiveRT = Math.max(0, reactionTime - pts.optimalReactionTime);
+          const effectiveMaxRT = pts.maxReactionTime - pts.optimalReactionTime;
+          const timeFactor = Math.max(0, 1 - effectiveRT / effectiveMaxRT);
           
           // Combined points (multiplicative)
           const points = Math.round(pts.maxClickPoints * accuracyFactor * timeFactor);
           
-          // Determine grade label based on thresholds
-          let grade = 'OK';
-          if (distance <= pts.clickPerfectDist && reactionTime <= pts.clickPerfectTime) {
-            grade = 'PERFECT';
-          } else if (distance <= pts.clickGreatDist && reactionTime <= pts.clickGreatTime) {
-            grade = 'GREAT';
-          }
+          // Determine grade label based on points
+          const grade = getGradeFromPoints(points, pts.maxClickPoints);
           
           return { points, grade, accuracyFactor, timeFactor };
         };
 
-        const calculateTrackingSamplePoints = (distance, isClicking) => {
+        const calculateTrackingSamplePoints = (distance, isClicking, maxPointsPerSample) => {
           const pts = TRIAL_CONFIG.points;
           const maxDist = TRIAL_CONFIG.trackingMaxDistance;
           
@@ -271,16 +281,10 @@
           // Continuous distance factor: 1 at center, 0 at maxDistance
           const distanceFactor = Math.max(0, 1 - distance / maxDist);
           
-          return pts.maxPointsPerSample * distanceFactor;
+          return maxPointsPerSample * distanceFactor;
         };
 
-        const getTrackingGrade = (accuracy) => {
-          const pts = TRIAL_CONFIG.points;
-          if (accuracy >= pts.trackPerfectPct) return 'PERFECT';
-          if (accuracy >= pts.trackGreatPct) return 'GREAT';
-          if (accuracy >= pts.trackOkPct) return 'OK';
-          return 'POOR';
-        };
+        // Note: moved getTrackingGrade logic to getGradeFromPoints helper above
 
         // ============================================
         // FLOATING POINTS COMPONENT
@@ -355,6 +359,10 @@
           const [totalScore, setTotalScore] = useState(0);
           const [countdown, setCountdown] = useState(3);
           
+          // New state for blocks
+          const [currentBlock, setCurrentBlock] = useState(1);
+          const [highScore, setHighScore] = useState(0);
+          
           // Current trial state
           const [targetPosition, setTargetPosition] = useState({ x: 0, y: 0 });
           const [cursorPosition, setCursorPosition] = useState({ x: 0, y: 0 });
@@ -383,7 +391,7 @@
           const [canvasSize, setCanvasSize] = useState({ width: 800, height: 600 });
 
           // Initialize trials
-          const initializeTrials = useCallback(() => {
+          const initializeTrials = useCallback((keepData = false) => {
             const allTrialTypes = [
               ...TRIAL_CONFIG.clickSequences,
               ...TRIAL_CONFIG.trackShapes.map(s => ({
@@ -392,18 +400,32 @@
               }))
             ];
             
-            const selected = [];
-            for (let i = 0; i < TRIAL_CONFIG.totalTrials; i++) {
-              const randomIndex = Math.floor(Math.random() * allTrialTypes.length);
-              selected.push({ ...allTrialTypes[randomIndex], instanceId: i });
-            }
+            // Shuffle for the block
+            const shuffled = [...allTrialTypes]
+              .map(value => ({ value, sort: Math.random() }))
+              .sort((a, b) => a.sort - b.sort)
+              .map(({ value }) => value);
+
+            const selected = shuffled.map((t, i) => ({ ...t, instanceId: i }));
             
             setTrials(selected);
             setCurrentTrialIndex(0);
-            setTrialData([]);
+            
+            if (!keepData) {
+              setTrialData([]);
+              setCurrentBlock(1);
+              setHighScore(0);
+            }
             setTotalScore(0);
             setFloatingPoints([]);
           }, []);
+
+          // Update highscore on results
+          useEffect(() => {
+            if (gameState === 'results') {
+               setHighScore(prev => Math.max(prev, totalScore));
+            }
+          }, [gameState, totalScore]);
 
           // Handle canvas resize
           useEffect(() => {
@@ -543,6 +565,7 @@
               const clickData = {
                 trialId: trial.id,
                 instanceId: trial.instanceId,
+                block: currentBlock,
                 type: 'click',
                 clickIndex: currentClickIndex,
                 reactionTime,
@@ -593,6 +616,10 @@
             let lastTargetPos = { ...targetPosition };
             let accumulatedPoints = 0;
             
+            // Normalize points: Target ~2000 points max per trial (similar to click sequences)
+            const expectedSamples = duration / TRIAL_CONFIG.samplingRate;
+            const maxPointsPerSample = 2000 / expectedSamples; 
+
             // Position sampling with continuous point accumulation
             sampleIntervalRef.current = setInterval(() => {
               const elapsed = performance.now() - startTime;
@@ -615,7 +642,7 @@
                 );
                 
                 // Calculate points for this sample
-                const samplePoints = calculateTrackingSamplePoints(distance, isClickingRef.current);
+                const samplePoints = calculateTrackingSamplePoints(distance, isClickingRef.current, maxPointsPerSample);
                 accumulatedPoints += samplePoints;
                 
                 // Update displayed points
@@ -652,7 +679,7 @@
                   : 0;
                 
                 const totalPoints = Math.round(accumulatedPoints);
-                const grade = getTrackingGrade(accuracy);
+                const grade = getGradeFromPoints(totalPoints, 2000);
                 
                 // Show floating points at last position
                 showPoints(totalPoints, grade, lastTargetPos);
@@ -661,6 +688,7 @@
                 const data = {
                   trialId: trial.id,
                   instanceId: trial.instanceId,
+                  block: currentBlock,
                   type: 'track',
                   shape: trial.shape,
                   duration,
@@ -780,7 +808,7 @@
                 {gameState === 'playing' && (
                   <div className="mt-2 flex items-center justify-center gap-6" style={{ fontFamily: 'Rajdhani' }}>
                     <span className="text-gray-500">
-                      Trial {currentTrialIndex + 1}/{trials.length}
+                      Block {currentBlock}/{TRIAL_CONFIG.totalBlocks} • Trial {currentTrialIndex + 1}/{trials.length}
                     </span>
                     <span className="text-2xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 to-orange-500">
                       {totalScore.toLocaleString()} pts
@@ -986,26 +1014,36 @@
                   
                   {/* RESULTS STATE */}
                   {gameState === 'results' && (
-                    <div className="absolute inset-0 flex items-center justify-center p-8">
-                      <div className="text-center space-y-6 max-w-lg">
+                    <div className="absolute inset-0 flex items-center justify-center p-8 overflow-y-auto" style={{ zIndex: 50 }}>
+                       <div className="bg-gray-900/90 absolute inset-0 -z-10 backdrop-blur-sm" />
+                      <div className="text-center space-y-4 max-w-lg w-full transform scale-90 md:scale-100 origin-center">
                         <h2 className="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-green-400 to-cyan-400">
-                          COMPLETE!
+                          BLOCK {currentBlock} COMPLETE!
                         </h2>
                         
                         <div 
-                          className="text-6xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 via-orange-500 to-pink-500"
+                          className="text-5xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 via-orange-500 to-pink-500"
                           style={{ textShadow: '0 0 40px rgba(251, 191, 36, 0.3)' }}
                         >
                           {totalScore.toLocaleString()}
                         </div>
-                        <div className="text-gray-400 text-lg" style={{ fontFamily: 'Rajdhani' }}>TOTAL POINTS</div>
+                        <div className="text-gray-400 text-lg" style={{ fontFamily: 'Rajdhani' }}>BLOCK SCORE</div>
                         
-                        <div className="grid grid-cols-2 gap-4 text-left mt-6" style={{ fontFamily: 'Rajdhani' }}>
+                        {/* Highscore Display */}
+                        <div className="bg-gray-800/80 rounded-xl p-3 border border-yellow-500/40 transform hover:scale-105 transition-transform mx-auto max-w-xs">
+                             <div className="text-yellow-400 font-bold tracking-wider mb-1 text-sm">PERSONAL BEST BLOCK</div>
+                             <div className="text-2xl font-black text-white">{highScore.toLocaleString()}</div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-3 text-left mt-4 text-sm" style={{ fontFamily: 'Rajdhani' }}>
                           {/* Click stats */}
-                          <div className="bg-gray-800/50 rounded-xl p-4 border border-pink-500/20">
-                            <h3 className="text-pink-400 font-bold mb-2">CLICK SEQUENCES</h3>
+                          <div className="bg-gray-800/50 rounded-xl p-3 border border-pink-500/20">
+                            <h3 className="text-pink-400 font-bold mb-2 text-base">CLICK SEQUENCES</h3>
                             {(() => {
-                              const clickTrials = trialData.filter(t => t.type === 'click');
+                              // Filter for current block only
+                              const blockTrials = trialData.filter(t => t.block === currentBlock);
+                              const clickTrials = blockTrials.filter(t => t.type === 'click');
+                              // ... (rest is same logic, just using local clickTrials)
                               const perfectHits = clickTrials.filter(t => t.grade === 'PERFECT').length;
                               const greatHits = clickTrials.filter(t => t.grade === 'GREAT').length;
                               const avgRT = clickTrials.length > 0
@@ -1031,7 +1069,8 @@
                           <div className="bg-gray-800/50 rounded-xl p-4 border border-cyan-500/20">
                             <h3 className="text-cyan-400 font-bold mb-2">TRACKING</h3>
                             {(() => {
-                              const trackTrials = trialData.filter(t => t.type === 'track');
+                              const blockTrials = trialData.filter(t => t.block === currentBlock);
+                              const trackTrials = blockTrials.filter(t => t.type === 'track');
                               const avgAcc = trackTrials.length > 0
                                 ? Math.round(trackTrials.reduce((s, t) => s + t.accuracy, 0) / trackTrials.length * 100)
                                 : 0;
@@ -1042,7 +1081,7 @@
                               const trackPoints = trackTrials.reduce((s, t) => s + t.points, 0);
                               return (
                                 <>
-                                  <p className="text-gray-400">Click Time: <span className="text-white">{avgAcc}%</span></p>
+                                  <p className="text-gray-400">Accuracy: <span className="text-white">{avgAcc}%</span></p>
                                   <p className="text-gray-400">Avg Dist: <span className="text-white">{avgDist}px</span></p>
                                   <p className="text-gray-400">Perfect: <span className="text-cyan-400">{perfectTracks}</span></p>
                                   <p className="text-gray-400">Points: <span className="text-yellow-400">{trackPoints.toLocaleString()}</span></p>
@@ -1055,19 +1094,29 @@
                         <div className="flex gap-4 justify-center pt-4">
                           <button
                             onClick={exportData}
-                            className="px-6 py-3 bg-gray-800 hover:bg-gray-700 rounded-xl text-gray-300 font-medium tracking-wider transition-all border border-gray-700"
+                            className="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-gray-300 font-medium tracking-wider transition-all border border-gray-700 text-sm"
                           >
-                            EXPORT DATA
+                            EXPORT ALL
                           </button>
                           <button
                             onClick={() => {
-                              setGameState('intro');
-                              setTrialData([]);
-                              setTotalScore(0);
+                              if (currentBlock < TRIAL_CONFIG.totalBlocks) {
+                                  setCurrentBlock(prev => prev + 1);
+                                  initializeTrials(true);
+                                  setGameState('countdown');
+                                  setCountdown(3);
+                              } else {
+                                  // Reset
+                                  setGameState('intro');
+                                  setTrialData([]);
+                                  setTotalScore(0);
+                                  setCurrentBlock(1);
+                                  setHighScore(0);
+                              }
                             }}
-                            className="px-8 py-3 bg-gradient-to-r from-purple-600 to-pink-600 rounded-xl text-white font-bold tracking-wider hover:from-purple-500 hover:to-pink-500 transition-all"
+                            className="px-6 py-2 bg-gradient-to-r from-purple-600 to-pink-600 rounded-xl text-white font-bold tracking-wider hover:from-purple-500 hover:to-pink-500 transition-all text-sm"
                           >
-                            PLAY AGAIN
+                            {currentBlock < TRIAL_CONFIG.totalBlocks ? "CONTINUE" : "FINISH"}
                           </button>
                         </div>
                       </div>
